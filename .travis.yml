@@ -56,6 +56,27 @@ jobs:
     - <<: *test-scylla
       env: SCYLLA_VERSION=2.0.0
 
+    - test-cosmos:
+      stage: test cosmos
+      os: windows
+      language: shell
+      install:
+        - choco install --no-progress -y elixir --version 1.10.3
+        - export PATH=/c/ProgramData/chocolatey/lib/Elixir/bin:$PATH
+        - mix local.hex --force
+        - mix local.rebar --force
+        - powershell -executionpolicy bypass -file test/windows/cosmosdb-download-install.ps1
+        - mix deps.get
+        - mix deps.compile
+      before_script:
+        - powershell -executionpolicy bypass -file test/windows/cosmosdb-start-wait.ps1
+      script: mix test.cosmosdb --max-cases 1
+      after_script:
+        - powershell -executionpolicy bypass -file test/windows/cosmosdb-stop-wait.ps1
+      env:
+        - CASSANDRA_IS_COSMOSDB=true
+        - CASSANDRA_NATIVE_PROTOCOL=v4
+
     - stage: check formatted
       script: mix format --check-formatted
       before_install: skip
@@ -66,3 +87,4 @@ stages:
   - check formatted
   - test
   - test scylla
+  - test cosmos
