@@ -104,7 +104,8 @@ defmodule Xandra.Cluster do
     :autodiscovery,
     :autodiscovered_nodes_port,
     :pool_supervisor,
-    pools: %{}
+    pools: %{},
+    nodes: %{}
   ]
 
   @doc """
@@ -208,8 +209,8 @@ defmodule Xandra.Cluster do
 
   # Used internally by Xandra.Cluster.ControlConnection.
   @doc false
-  def activate(cluster, node_ref, address, port) do
-    GenServer.cast(cluster, {:activate, node_ref, address, port})
+  def activate(cluster, node_ref, address, port, local_node) do
+    GenServer.cast(cluster, {:activate, node_ref, address, port, local_node})
   end
 
   # Used internally by Xandra.Cluster.ControlConnection.
@@ -328,7 +329,11 @@ defmodule Xandra.Cluster do
   @spec execute(cluster, Xandra.statement() | Xandra.Prepared.t(), Xandra.values(), keyword) ::
           {:ok, Xandra.result()} | {:error, Xandra.error()}
   def execute(cluster, query, params, options) do
-    with_conn_and_retrying(cluster, options, &Xandra.execute(&1, query, params, options))
+    with_conn_and_retrying(
+      cluster,
+      [query: query] ++ options,
+      &Xandra.execute(&1, query, params, options)
+    )
   end
 
   @doc """
@@ -383,11 +388,13 @@ defmodule Xandra.Cluster do
   end
 
   defp with_conn_and_retrying(cluster, options, fun) do
-    RetryStrategy.run_with_retrying(options, fn -> with_conn(cluster, fun) end)
+    RetryStrategy.run_with_retrying(options, fn -> with_conn(cluster, fun, options) end)
   end
 
-  defp with_conn(cluster, fun) do
-    case GenServer.call(cluster, :checkout) do
+  defp with_conn(cluster, fun, options \\ []) do
+    query = Keyword.get(options, :query)
+
+    case GenServer.call(cluster, {:checkout, query}) do
       {:ok, pool} ->
         fun.(pool)
 
@@ -407,17 +414,18 @@ defmodule Xandra.Cluster do
   end
 
   @impl true
-  def handle_call(:checkout, _from, %__MODULE__{} = state) do
+  def handle_call({:checkout, query}, _from, %__MODULE__{} = state) do
     %{
       node_refs: node_refs,
       load_balancing: load_balancing,
-      pools: pools
+      pools: pools,
+      nodes: nodes
     } = state
 
     if Enum.empty?(pools) do
       {:reply, {:error, :empty}, state}
     else
-      pool = select_pool(load_balancing, pools, node_refs)
+      pool = select_pool(load_balancing, query, pools, node_refs, nodes)
       {:reply, {:ok, pool}, state}
     end
   end
@@ -425,20 +433,20 @@ defmodule Xandra.Cluster do
   @impl true
   def handle_cast(message, state)
 
-  def handle_cast({:activate, node_ref, address, port}, %__MODULE__{} = state) do
+  def handle_cast({:activate, node_ref, address, port, local_node}, %__MODULE__{} = state) do
     _ = Logger.debug("Control connection for #{:inet.ntoa(address)}:#{port} is up")
 
     # Update the node_refs with the actual address of the control connection node.
     state = update_in(state.node_refs, &List.keystore(&1, node_ref, 0, {node_ref, address}))
 
-    state = start_pool(state, address, port)
+    state = start_pool(state, address, port, local_node)
     {:noreply, state}
   end
 
   def handle_cast({:discovered_peers, peers}, %__MODULE__{} = state) do
     _ = Logger.debug("Discovered peers: #{inspect(peers)}")
     port = state.autodiscovered_nodes_port
-    state = Enum.reduce(peers, state, &start_pool(_state = &2, _peer = &1, port))
+    state = Enum.reduce(peers, state, &start_pool(_state = &2, _peer = &1.address, port, &1))
     {:noreply, state}
   end
 
@@ -469,11 +477,12 @@ defmodule Xandra.Cluster do
     end)
   end
 
-  defp start_pool(state, address, port) do
+  defp start_pool(state, address, port, %__MODULE__.Node{} = node) do
     %{
       options: options,
       pool_supervisor: pool_supervisor,
-      pools: pools
+      pools: pools,
+      nodes: nodes
     } = state
 
     options = Keyword.merge(options, address: address, port: port)
@@ -482,7 +491,7 @@ defmodule Xandra.Cluster do
     case Supervisor.start_child(pool_supervisor, child_spec) do
       {:ok, pool} ->
         _ = Logger.debug("Started connection to #{inspect(address)}")
-        %{state | pools: Map.put(pools, address, pool)}
+        %{state | pools: Map.put(pools, address, pool), nodes: Map.put(nodes, address, node)}
 
       {:error, {:already_started, _pool}} ->
         # TODO: to have a reliable cluster name, we need to bring the name given on
@@ -515,10 +524,10 @@ defmodule Xandra.Cluster do
   end
 
   defp handle_status_change(state, %{effect: "DOWN", address: address}) do
-    %{pool_supervisor: pool_supervisor, pools: pools} = state
+    %{pool_supervisor: pool_supervisor, pools: pools, nodes: nodes} = state
 
     _ = Supervisor.terminate_child(pool_supervisor, address)
-    %{state | pools: Map.delete(pools, address)}
+    %{state | pools: Map.delete(pools, address), nodes: Map.delete(nodes, address)}
   end
 
   # We don't care about changes in the topology if we're not autodiscovering
@@ -527,15 +536,19 @@ defmodule Xandra.Cluster do
     state
   end
 
-  defp handle_topology_change(state, %{effect: "NEW_NODE", address: address}) do
-    start_pool(state, address, state.autodiscovered_nodes_port)
+  defp handle_topology_change(state, %{
+         effect: "NEW_NODE",
+         address: address,
+         node: %__MODULE__.Node{} = node
+       }) do
+    start_pool(state, address, state.autodiscovered_nodes_port, node)
   end
 
   defp handle_topology_change(state, %{effect: "REMOVED_NODE", address: address}) do
-    %{pool_supervisor: pool_supervisor, pools: pools} = state
+    %{pool_supervisor: pool_supervisor, pools: pools, nodes: nodes} = state
     _ = Supervisor.terminate_child(pool_supervisor, address)
     _ = Supervisor.delete_child(pool_supervisor, address)
-    %{state | pools: Map.delete(pools, address)}
+    %{state | pools: Map.delete(pools, address), nodes: Map.delete(nodes, address)}
   end
 
   defp handle_topology_change(state, %{effect: "MOVED_NODE"} = event) do
@@ -543,15 +556,25 @@ defmodule Xandra.Cluster do
     state
   end
 
-  defp select_pool(:random, pools, _node_refs) do
+  defp select_pool(:random, _query, pools, _node_refs, _) do
     {_address, pool} = Enum.random(pools)
     pool
   end
 
-  defp select_pool(:priority, pools, node_refs) do
+  defp select_pool(:priority, _query, pools, node_refs, _) do
     Enum.find_value(node_refs, fn {_node_ref, address} ->
       Map.get(pools, address)
     end)
+  end
+
+  defp select_pool(load_balancing, query, pools, node_refs, nodes) do
+    with {:ok, node} <- load_balancing.select_node(nodes, query),
+         {:ok, pool} <- Map.fetch(pools, node.address) do
+      pool
+    else
+      :error ->
+        select_pool(:random, query, pools, node_refs, nodes)
+    end
   end
 
   defp parse_node(string) do
